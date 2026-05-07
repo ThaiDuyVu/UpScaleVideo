@@ -29,7 +29,7 @@ venv/
 # =========================
 # Dataset / Training Data
 # =========================
-data/
+/data/
 datasets/
 dataset/
 *.zip
