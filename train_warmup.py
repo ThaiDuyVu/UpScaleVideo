@@ -6,7 +6,7 @@ import os
 from skimage.metrics import structural_similarity as ssim
 import torch.nn.functional as F
 from torchvision.models import vgg16
-
+from pytorch_msssim import ssim as ssim_metric
 from src.data.dataset import VideoDataset
 from src.model.generator import Generator
 
@@ -199,12 +199,14 @@ def gradient_loss(pred, target):
 # KL LOSS WITH FREE BITS
 # Không phạt nếu KL < free_bits → tránh posterior collapse
 # =========================
-def kl_loss_free_bits(mu, logvar, free_bits=0.5):
-    kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
-    kl_per_dim = torch.clamp(kl_per_dim, min=free_bits)
-    return kl_per_dim.mean()
+# THÊM sau gradient_loss:
+def frequency_loss(pred, target):
+    pred_fft   = torch.fft.rfft2(pred,   norm='ortho')
+    target_fft = torch.fft.rfft2(target, norm='ortho')
+    return F.l1_loss(torch.abs(pred_fft), torch.abs(target_fft))
 
-
+def ssim_loss(pred, target):
+    return 1.0 - ssim_metric(pred, target, data_range=1.0, size_average=True)
 # =========================
 # TRAIN LOOP
 # =========================
@@ -217,12 +219,6 @@ for epoch in range(epochs):
     total_loss    = 0
     valid_batches = 0  # FIX: đếm batch hợp lệ, tránh NaN ảnh hưởng avg loss
 
-    # KL warm-up: 5 epoch đầu tắt để model học reconstruction trước
-    # Sau đó tăng dần từ 1e-7, tối đa 1e-5
-    if epoch < 5:
-        kl_weight = 0.0
-    else:
-        kl_weight = min(1e-7 * (epoch - 4), 1e-5)
 
     loop = tqdm(train_loader)
 
@@ -239,27 +235,27 @@ for epoch in range(epochs):
 
         with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
 
-            pred, mu, logvar = model(lr_img)
+            pred = model(lr_img)
 
             # FIX: clamp logvar/mu trước khi tính loss
             # logvar > 88 → exp() → inf trên float32 → NaN
-            logvar = torch.clamp(logvar, min=-10.0, max=10.0)
-            mu     = torch.clamp(mu,     min=-10.0, max=10.0)
+
 
             pred = pred.clamp(0, 1)
+
 
             loss_l1   = criterion(pred, hr_img)
             loss_edge = gradient_loss(pred, hr_img)
             loss_perc = perceptual_loss_fn(pred, hr_img)
-            kl_loss   = kl_loss_free_bits(mu, logvar)
-
+            loss_freq = frequency_loss(pred, hr_img)
+            loss_ssim = ssim_loss(pred, hr_img)
             loss = (
-                1.0  * loss_l1
-                + 0.1  * loss_edge
-                + 0.05 * loss_perc
-                + kl_weight * kl_loss
+                0.7 * loss_l1
+                + 0.1 * loss_edge
+                + 0.1 * loss_perc
+                + 0.1 * loss_freq
+                + 0.2 * loss_ssim
             )
-
         # FIX: skip batch NaN thay vì crash cả training
         if not torch.isfinite(loss):
             print(f"\n[WARNING] NaN/Inf loss — skipping batch | "
@@ -286,8 +282,8 @@ for epoch in range(epochs):
             l1=f"{loss_l1.item():.4f}",
             edge=f"{loss_edge.item():.4f}",
             perc=f"{loss_perc.item():.4f}",
-            kl=f"{kl_loss.item():.2f}",
-            kl_w=f"{kl_weight:.2e}"
+            freq=f"{loss_freq.item():.4f}",
+            ssim=f"{loss_ssim.item():.4f}",
         )
 
     # FIX: chia valid_batches thực tế thay len(train_loader)
@@ -326,7 +322,7 @@ for epoch in range(epochs):
                 hr_img = hr_img / 255.0
 
             with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-                pred, _, _ = model(lr_img)
+                pred = model(lr_img)
                 pred = pred.clamp(0, 1)
                 val_loss += criterion(pred, hr_img).item()
 
@@ -355,7 +351,6 @@ for epoch in range(epochs):
     print(f"🔥 Val Loss:      {val_loss:.6f}")
     print(f"🔥 PSNR:          {avg_psnr:.2f} dB")
     print(f"🔥 SSIM:          {avg_ssim:.4f}")
-    print(f"🔥 KL weight:     {kl_weight:.2e}")
 
 
     # =========================

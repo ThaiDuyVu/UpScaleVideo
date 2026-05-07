@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.model.wavelet import DWT, IWT
-from src.model.vae import VAE
+from src.model.vae import WaveletEncoder   # đổi tên import
 from src.model.kan import KAN
 
 
@@ -11,26 +11,12 @@ class Generator(nn.Module):
     def __init__(self):
         super(Generator, self).__init__()
 
-        self.dwt = DWT()
-        self.vae = VAE()
-        self.kan = KAN()
-        self.iwt = IWT()
+        self.dwt     = DWT()
+        self.encoder = WaveletEncoder()    # thay self.vae
+        self.kan     = KAN()
+        self.iwt     = IWT()
 
-        # ===================================================
-        # FLOW MỚI (nhất quán wavelet domain):
-        #
-        #  LR [B,3,128,128]
-        #  → DWT  → [B,12,64,64]   wavelet coefficients
-        #  → VAE  → [B,12,64,64]   vẫn wavelet domain
-        #  → KAN  → [B,12,64,64]   vẫn wavelet domain
-        #  → IWT  → [B,3,128,128]  pixel domain (reconstruct)
-        #  → up1  → [B,3,256,256]  upsample 2x
-        #  → up2  → [B,3,512,512]  upsample 2x
-        #
-        # FIX: IWT phải nhận wavelet data → đặt TRƯỚC các upscale block
-        # ===================================================
-
-        # Refine sau IWT trong pixel domain
+        # Refine sau IWT
         self.refine = nn.Sequential(
             nn.Conv2d(3, 32, 3, padding=1),
             nn.LeakyReLU(0.2),
@@ -39,18 +25,24 @@ class Generator(nn.Module):
             nn.Conv2d(32, 3, 3, padding=1),
         )
 
-        # Upscale 128 → 256 (2x)
+        # Upscale 128 → 256 (2x) — thêm 2 conv trước PixelShuffle
         self.up1 = nn.Sequential(
-            nn.Conv2d(3, 12, 3, padding=1),
+            nn.Conv2d(3, 32, 3, padding=1),
             nn.LeakyReLU(0.2),
-            nn.PixelShuffle(2),             # 12ch → 3ch, H×2, W×2
+            nn.Conv2d(32, 32, 3, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(32, 12, 1),           # 12 = 3 * 2^2
+            nn.PixelShuffle(2),
         )
 
-        # Upscale 256 → 512 (2x)
+        # Upscale 256 → 512 (2x) — thêm 2 conv trước PixelShuffle
         self.up2 = nn.Sequential(
-            nn.Conv2d(3, 12, 3, padding=1),
+            nn.Conv2d(3, 32, 3, padding=1),
             nn.LeakyReLU(0.2),
-            nn.PixelShuffle(2),             # 12ch → 3ch, H×2, W×2
+            nn.Conv2d(32, 32, 3, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(32, 12, 1),
+            nn.PixelShuffle(2),
         )
 
         # Refine cuối
@@ -58,30 +50,33 @@ class Generator(nn.Module):
             nn.Conv2d(3, 32, 3, padding=1),
             nn.LeakyReLU(0.2),
             nn.Conv2d(32, 3, 3, padding=1),
-            nn.Sigmoid(),                   # output [0,1]
+            nn.Sigmoid(),
         )
+
+        # Init sub-pixel conv tránh checkerboard
+        self._init_subpixel(self.up1)
+        self._init_subpixel(self.up2)
+
+    def _init_subpixel(self, module):
+        for m in module.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x):
         # x: [B, 3, 128, 128]
 
-        # ===== WAVELET DOMAIN =====
-        wave = self.dwt(x)              # [B, 12, 64, 64]
+        wave     = self.dwt(x)              # [B, 12, 64, 64]
+        recon    = self.encoder(wave)       # [B, 12, 64, 64] — không có mu/logvar
+        features = self.kan(recon)          # [B, 12, 64, 64]
+        pix      = self.iwt(features)       # [B, 3, 128, 128]
 
-        recon, mu, logvar = self.vae(wave)   # [B, 12, 64, 64]
+        pix = pix + self.refine(pix)        # residual refine
 
-        features = self.kan(recon)      # [B, 12, 64, 64]
+        pix = self.up1(pix)                 # [B, 3, 256, 256]
+        pix = self.up2(pix)                 # [B, 3, 512, 512]
 
-        # ===== BACK TO PIXEL DOMAIN =====
-        # IWT nhận đúng wavelet coefficients → pixel domain
-        pix = self.iwt(features)        # [B, 3, 128, 128]
+        out = self.final_refine(pix)        # [B, 3, 512, 512]
 
-        # Refine + residual connection với LR input
-        pix = pix + self.refine(pix)    # [B, 3, 128, 128]
-
-        # ===== UPSCALE =====
-        pix = self.up1(pix)             # [B, 3, 256, 256]
-        pix = self.up2(pix)             # [B, 3, 512, 512]
-
-        out = self.final_refine(pix)    # [B, 3, 512, 512], range [0,1]
-
-        return out, mu, logvar
+        return out                          # chỉ trả out, không mu/logvar
