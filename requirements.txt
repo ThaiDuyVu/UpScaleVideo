@@ -1,0 +1,8 @@
+torch
+torchvision
+opencv-python
+numpy
+tqdm
+pywavelets
+Pillow
+scikit-image
