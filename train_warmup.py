@@ -7,6 +7,7 @@ from skimage.metrics import structural_similarity as ssim
 import torch.nn.functional as F
 from torchvision.models import vgg16
 from pytorch_msssim import ssim as ssim_metric
+
 from src.data.dataset import VideoDataset
 from src.model.generator import Generator
 
@@ -139,17 +140,12 @@ perceptual_loss_fn = PerceptualLoss().to(device)
 # =========================
 model = Generator().to(device)
 
-# FIX: AdamW + weight_decay thay Adam thuần
-# AdamW tách weight decay ra khỏi gradient update → ổn định hơn
 optimizer = torch.optim.AdamW(
     model.parameters(),
     lr=1e-4,
     weight_decay=1e-4
 )
 
-# FIX: ReduceLROnPlateau thay StepLR
-# Giảm LR khi val_loss không cải thiện sau patience=2 epoch
-# thay vì giảm cứng mỗi 10 epoch bất kể model học tốt hay không
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
     optimizer,
     mode='min',
@@ -185,9 +181,10 @@ def psnr(pred, target):
 
 
 # =========================
-# EDGE LOSS
+# LOSS FUNCTIONS
 # =========================
 def gradient_loss(pred, target):
+    """Edge loss — giữ lại để bổ sung cho frequency loss."""
     pred_dx   = pred[:, :, :, 1:]   - pred[:, :, :, :-1]
     target_dx = target[:, :, :, 1:] - target[:, :, :, :-1]
     pred_dy   = pred[:, :, 1:, :]   - pred[:, :, :-1, :]
@@ -195,18 +192,18 @@ def gradient_loss(pred, target):
     return F.l1_loss(pred_dx, target_dx) + F.l1_loss(pred_dy, target_dy)
 
 
-# =========================
-# KL LOSS WITH FREE BITS
-# Không phạt nếu KL < free_bits → tránh posterior collapse
-# =========================
-# THÊM sau gradient_loss:
 def frequency_loss(pred, target):
+    """FFT Frequency loss — supervise high-frequency components."""
     pred_fft   = torch.fft.rfft2(pred,   norm='ortho')
     target_fft = torch.fft.rfft2(target, norm='ortho')
     return F.l1_loss(torch.abs(pred_fft), torch.abs(target_fft))
 
+
 def ssim_loss(pred, target):
+    """SSIM loss — supervise structural similarity."""
     return 1.0 - ssim_metric(pred, target, data_range=1.0, size_average=True)
+
+
 # =========================
 # TRAIN LOOP
 # =========================
@@ -217,8 +214,7 @@ for epoch in range(epochs):
     model.train()
 
     total_loss    = 0
-    valid_batches = 0  # FIX: đếm batch hợp lệ, tránh NaN ảnh hưởng avg loss
-
+    valid_batches = 0
 
     loop = tqdm(train_loader)
 
@@ -236,19 +232,14 @@ for epoch in range(epochs):
         with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
 
             pred = model(lr_img)
-
-            # FIX: clamp logvar/mu trước khi tính loss
-            # logvar > 88 → exp() → inf trên float32 → NaN
-
-
             pred = pred.clamp(0, 1)
-
 
             loss_l1   = criterion(pred, hr_img)
             loss_edge = gradient_loss(pred, hr_img)
             loss_perc = perceptual_loss_fn(pred, hr_img)
             loss_freq = frequency_loss(pred, hr_img)
             loss_ssim = ssim_loss(pred, hr_img)
+
             loss = (
                 0.7 * loss_l1
                 + 0.1 * loss_edge
@@ -256,18 +247,19 @@ for epoch in range(epochs):
                 + 0.1 * loss_freq
                 + 0.2 * loss_ssim
             )
-        # FIX: skip batch NaN thay vì crash cả training
+
+        # Skip batch NaN thay vì crash cả training
         if not torch.isfinite(loss):
             print(f"\n[WARNING] NaN/Inf loss — skipping batch | "
                   f"l1={loss_l1.item():.4f} edge={loss_edge.item():.4f} "
-                  f"perc={loss_perc.item():.4f} kl={kl_loss.item():.4f}")
+                  f"perc={loss_perc.item():.4f} freq={loss_freq.item():.4f} "
+                  f"ssim={loss_ssim.item():.4f}")
             optimizer.zero_grad(set_to_none=True)
             continue
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
 
-        # FIX: clip 0.5 thay 1.0 — kiểm soát gradient explosion tốt hơn
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
 
         scaler.step(optimizer)
@@ -286,7 +278,6 @@ for epoch in range(epochs):
             ssim=f"{loss_ssim.item():.4f}",
         )
 
-    # FIX: chia valid_batches thực tế thay len(train_loader)
     avg_train_loss = total_loss / max(valid_batches, 1)
 
     print("\n" + "=" * 60)
@@ -322,13 +313,12 @@ for epoch in range(epochs):
                 hr_img = hr_img / 255.0
 
             with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-                pred = model(lr_img)
-                pred = pred.clamp(0, 1)
+                pred     = model(lr_img)
+                pred     = pred.clamp(0, 1)
                 val_loss += criterion(pred, hr_img).item()
 
             psnr_list.append(psnr(pred, hr_img).item())
 
-            # FIX: tính SSIM toàn bộ batch, không chỉ i==0
             for b in range(pred.shape[0]):
                 pred_np = pred[b].permute(1, 2, 0).cpu().numpy()
                 hr_np   = hr_img[b].permute(1, 2, 0).cpu().numpy()
@@ -342,7 +332,6 @@ for epoch in range(epochs):
 
             num_batches += 1
 
-    # FIX: chia đúng num_batches thực tế
     val_loss /= num_batches
 
     avg_psnr = sum(psnr_list) / len(psnr_list)
@@ -352,15 +341,9 @@ for epoch in range(epochs):
     print(f"🔥 PSNR:          {avg_psnr:.2f} dB")
     print(f"🔥 SSIM:          {avg_ssim:.4f}")
 
-
-    # =========================
-    # LR SCHEDULER
-    # FIX: ReduceLROnPlateau cần val_loss để quyết định giảm LR
-    # =========================
     scheduler.step(val_loss)
     current_lr = optimizer.param_groups[0]['lr']
     print(f"🔥 Learning rate: {current_lr:.2e}")
-
 
     # =========================
     # SAVE CHECKPOINT
