@@ -126,7 +126,7 @@ class PerceptualLoss(nn.Module):
         )
 
     def forward(self, pred, target):
-        # FIX: cast float32 → tránh VGG NaN với AMP float16
+        # FIX: float32 → tránh VGG NaN với AMP float16
         pred_n   = (pred.float()   - self.mean) / self.std
         target_n = (target.float() - self.mean) / self.std
         return F.l1_loss(self.vgg(pred_n), self.vgg(target_n))
@@ -152,13 +152,14 @@ scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
     factor=0.5,
     patience=2,
     min_lr=1e-6,
-    verbose=True
+    # FIX: bỏ verbose=True → dùng get_last_lr() thay thế, tránh FutureWarning
 )
 
 criterion = nn.L1Loss()
 
-# AMP scaler — chỉ active trên CUDA
-scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+# FIX: dùng torch.amp.GradScaler thay torch.cuda.amp.GradScaler → tránh FutureWarning
+use_amp = torch.cuda.is_available()
+scaler  = torch.amp.GradScaler('cuda', enabled=use_amp)
 
 
 # =========================
@@ -194,8 +195,8 @@ def gradient_loss(pred, target):
 
 def frequency_loss(pred, target):
     """
-    FFT Frequency loss — supervise high-frequency components.
-    FIX: cast float32 + clamp amplitude → tránh NaN/Inf với AMP float16.
+    FFT Frequency loss.
+    FIX: float32 + clamp amplitude → tránh NaN/Inf với AMP float16.
     """
     pred_f     = pred.float().clamp(0, 1)
     target_f   = target.float().clamp(0, 1)
@@ -208,8 +209,8 @@ def frequency_loss(pred, target):
 
 def ssim_loss(pred, target):
     """
-    SSIM loss — supervise structural similarity.
-    FIX: cast float32 → tránh NaN với AMP float16.
+    SSIM loss.
+    FIX: float32 → tránh NaN với AMP float16.
     """
     return 1.0 - ssim_metric(
         pred.float(), target.float(),
@@ -243,11 +244,12 @@ for epoch in range(epochs):
 
         optimizer.zero_grad(set_to_none=True)
 
-        with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+        # FIX: dùng torch.amp.autocast thay torch.cuda.amp.autocast → tránh FutureWarning
+        with torch.amp.autocast('cuda', enabled=use_amp):
 
             pred = model(lr_img)
 
-            # FIX: kiểm tra NaN trong output model trước khi tính loss
+            # Kiểm tra NaN trong output model
             if not torch.isfinite(pred).all():
                 print(f"\n[WARNING] NaN/Inf in model output — skipping batch")
                 optimizer.zero_grad(set_to_none=True)
@@ -269,7 +271,6 @@ for epoch in range(epochs):
                 + 0.2 * loss_ssim
             )
 
-        # Skip batch NaN/Inf
         if not torch.isfinite(loss):
             print(f"\n[WARNING] NaN/Inf loss — skipping batch | "
                   f"l1={loss_l1.item():.4f} edge={loss_edge.item():.4f} "
@@ -281,7 +282,6 @@ for epoch in range(epochs):
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
 
-        # FIX: giảm max_norm 0.5 → 0.1 để KAN mới không explode đầu training
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
 
         scaler.step(optimizer)
@@ -334,7 +334,7 @@ for epoch in range(epochs):
                 lr_img = lr_img / 255.0
                 hr_img = hr_img / 255.0
 
-            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+            with torch.amp.autocast('cuda', enabled=use_amp):
                 pred     = model(lr_img)
                 pred     = pred.clamp(0, 1)
                 val_loss += criterion(pred, hr_img).item()
@@ -342,7 +342,7 @@ for epoch in range(epochs):
             psnr_list.append(psnr(pred, hr_img).item())
 
             for b in range(pred.shape[0]):
-                # FIX: .float() trước khi chuyển numpy → tránh lỗi float16 → numpy
+                # FIX: float() trước numpy → tránh lỗi float16 → numpy
                 pred_np = pred[b].permute(1, 2, 0).cpu().float().numpy()
                 hr_np   = hr_img[b].permute(1, 2, 0).cpu().float().numpy()
 
@@ -364,6 +364,7 @@ for epoch in range(epochs):
     print(f"🔥 SSIM:          {avg_ssim:.4f}")
 
     scheduler.step(val_loss)
+    # FIX: dùng get_last_lr() thay verbose=True
     current_lr = optimizer.param_groups[0]['lr']
     print(f"🔥 Learning rate: {current_lr:.2e}")
 
