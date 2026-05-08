@@ -196,10 +196,27 @@ def kl_loss_free_bits(mu, logvar, free_bits=0.5):
 
 
 # =========================
-# CHECKPOINT
+# CHECKPOINT + RESUME
 # =========================
 os.makedirs("checkpoints", exist_ok=True)
 best_val_loss = float("inf")
+start_epoch   = 0
+
+# Resume từ epoch 3 (epoch cuối chạy tốt trước khi crash)
+# Thay số này nếu muốn resume từ epoch khác
+RESUME_PATH = "checkpoints/gan_epoch_3.pth"
+
+if os.path.exists(RESUME_PATH):
+    ckpt = torch.load(RESUME_PATH, map_location=device)
+    generator.load_state_dict(ckpt["generator"])
+    discriminator.load_state_dict(ckpt["discriminator"])
+    opt_G.load_state_dict(ckpt["opt_G"])
+    opt_D.load_state_dict(ckpt["opt_D"])
+    start_epoch   = ckpt["epoch"] + 1
+    best_val_loss = ckpt["val_loss"]
+    print(f"✅ Resumed from {RESUME_PATH} (epoch {ckpt['epoch']+1}, val_loss={ckpt['val_loss']:.6f})")
+else:
+    print(f"[INFO] No resume checkpoint found, starting from epoch 1")
 
 
 # =========================
@@ -207,7 +224,7 @@ best_val_loss = float("inf")
 # =========================
 epochs = 30
 
-for epoch in range(epochs):
+for epoch in range(start_epoch, epochs):
 
     generator.train()
     discriminator.train()
@@ -216,13 +233,23 @@ for epoch in range(epochs):
     # Giữ kl_weight nhỏ — VAE đã học tốt rồi
     kl_weight = 1e-5
 
-    # GAN weight warm-up:
-    # Epoch 0-2: gan_weight nhỏ → generator ổn định trước
-    # Epoch 3+:  tăng lên 0.01 → GAN bắt đầu ảnh hưởng
-    if epoch < 3:
+    # GAN weight warm-up (conservative):
+    # adv loss ~8-9 rất lớn → cần weight rất nhỏ để không át L1
+    # Công thức: effective_adv = adv * gan_weight
+    # Muốn effective_adv < 10% của L1 (~0.02) → gan_weight < 0.002
+    #
+    # Epoch 0-4:  0.001  (ổn định)
+    # Epoch 5-9:  0.0015 (tăng rất chậm)
+    # Epoch 10-14: 0.002 (plateau)
+    # Epoch 15+:  0.003  (max)
+    if epoch < 5:
         gan_weight = 0.001
+    elif epoch < 10:
+        gan_weight = 0.0015
+    elif epoch < 15:
+        gan_weight = 0.002
     else:
-        gan_weight = min(0.001 + 0.003 * (epoch - 2), 0.01)
+        gan_weight = 0.003
 
     total_loss_G  = 0
     total_loss_D  = 0
