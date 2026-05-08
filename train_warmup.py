@@ -162,7 +162,7 @@ scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
 criterion = nn.L1Loss()
 
 # AMP scaler — chỉ active trên CUDA, tắt trên MPS/CPU
-scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+scaler = torch.amp.GradScaler('cuda', enabled=torch.cuda.is_available())
 
 
 # =========================
@@ -198,6 +198,8 @@ def gradient_loss(pred, target):
 # =========================
 # KL LOSS WITH FREE BITS
 # Không phạt nếu KL < free_bits → tránh posterior collapse
+# Hoạt động với cả 2D [B,D] và 4D [B,C,H,W] tensor
+# vì .mean() flatten toàn bộ trước khi tính trung bình
 # =========================
 def kl_loss_free_bits(mu, logvar, free_bits=0.5):
     kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
@@ -237,7 +239,7 @@ for epoch in range(epochs):
 
         optimizer.zero_grad(set_to_none=True)
 
-        with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+        with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
 
             pred, mu, logvar = model(lr_img)
 
@@ -325,7 +327,7 @@ for epoch in range(epochs):
                 lr_img = lr_img / 255.0
                 hr_img = hr_img / 255.0
 
-            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+            with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
                 pred, _, _ = model(lr_img)
                 pred = pred.clamp(0, 1)
                 val_loss += criterion(pred, hr_img).item()
