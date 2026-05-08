@@ -21,10 +21,6 @@ venv/
 # =========================
 # AI Models / Checkpoints
 # =========================
-*.pth
-*.pt
-*.ckpt
-*.onnx
 
 # =========================
 # Dataset / Training Data
