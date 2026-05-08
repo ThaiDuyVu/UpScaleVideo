@@ -20,17 +20,17 @@ class Generator(nn.Module):
         # PIPELINE:
         #
         #  LR [B,3,128,128]
-        #  → DWT     → [B,12,64,64]   wavelet domain
-        #  → Encoder → [B,12,64,64]   gated residual (bypass-safe)
-        #  → KAN     → [B,12,64,64]   multi-scale feature refine
-        #  → IWT     → [B,3,128,128]  pixel domain
-        #  → refine  → [B,3,128,128]  residual refine (+ LR shortcut)
-        #  → up1     → [B,3,256,256]  upsample 2x
-        #  → up2     → [B,3,512,512]  upsample 2x
-        #  → final   → [B,3,512,512]  output [0,1]
+        #  → DWT      → [B,12,64,64]   wavelet domain
+        #  → Encoder  → [B,12,64,64]   gated residual (bypass-safe)
+        #  → KAN      → [B,12,64,64]   multi-scale feature refine
+        #  → IWT      → [B,3,128,128]  pixel domain
+        #  → refine   → [B,3,128,128]  residual refine
+        #  → up1 (2x) → [B,3,256,256]
+        #  → up2 (2x) → [B,3,512,512]
+        #  → final    → [B,3,512,512]  output [0,1]
         # ===================================================
 
-        # Refine sau IWT trong pixel domain
+        # Refine sau IWT — học residual so với LR gốc
         self.refine = nn.Sequential(
             nn.Conv2d(3, 32, 3, padding=1),
             nn.LeakyReLU(0.2),
@@ -45,8 +45,8 @@ class Generator(nn.Module):
             nn.LeakyReLU(0.2),
             nn.Conv2d(32, 32, 3, padding=1),
             nn.LeakyReLU(0.2),
-            nn.Conv2d(32, 12, 1),
-            nn.PixelShuffle(2),             # → [B, 3, 256, 256]
+            nn.Conv2d(32, 12, 1),      # 12 = 3 * 2^2
+            nn.PixelShuffle(2),        # → [B, 3, 256, 256]
         )
 
         # Upscale 256 → 512 (2x)
@@ -55,26 +55,29 @@ class Generator(nn.Module):
             nn.LeakyReLU(0.2),
             nn.Conv2d(32, 32, 3, padding=1),
             nn.LeakyReLU(0.2),
-            nn.Conv2d(32, 12, 1),
-            nn.PixelShuffle(2),             # → [B, 3, 512, 512]
+            nn.Conv2d(32, 12, 1),      # 12 = 3 * 2^2
+            nn.PixelShuffle(2),        # → [B, 3, 512, 512]
         )
 
-        # Refine cuối
+        # Refine cuối — KHÔNG dùng Sigmoid để tránh bị kéo về 0.5
+        # Thay bằng clamp [0,1] trong forward
         self.final_refine = nn.Sequential(
             nn.Conv2d(3, 32, 3, padding=1),
             nn.LeakyReLU(0.2),
             nn.Conv2d(32, 3, 3, padding=1),
-            nn.Sigmoid(),
         )
 
-        # Init upscale conv — tránh checkerboard artifact
+        # Init upscale conv tránh checkerboard
         self._init_subpixel(self.up1)
         self._init_subpixel(self.up2)
 
-        # Init refine cuối: bias → 0.5 để Sigmoid output ≈ 0.5 lúc đầu
-        # Tránh output bị kéo về 0 hoặc 1 hoàn toàn
-        nn.init.zeros_(self.final_refine[-2].weight)
-        nn.init.constant_(self.final_refine[-2].bias, 0.0)
+        # Init refine: weight nhỏ, bias=0 → output ≈ identity lúc đầu
+        # KHÔNG zero weight (sẽ gây output hằng số)
+        nn.init.xavier_uniform_(self.refine[-1].weight, gain=0.1)
+        nn.init.zeros_(self.refine[-1].bias)
+
+        nn.init.xavier_uniform_(self.final_refine[-1].weight, gain=0.1)
+        nn.init.zeros_(self.final_refine[-1].bias)
 
     def _init_subpixel(self, module):
         for m in module.modules():
@@ -87,16 +90,20 @@ class Generator(nn.Module):
         # x: [B, 3, 128, 128]
 
         wave     = self.dwt(x)           # [B, 12, 64, 64]
-        recon    = self.encoder(wave)    # [B, 12, 64, 64] — gated, bypass-safe
+        recon    = self.encoder(wave)    # [B, 12, 64, 64] — gated bypass-safe
         features = self.kan(recon)       # [B, 12, 64, 64]
         pix      = self.iwt(features)    # [B, 3, 128, 128]
 
-        # Residual với LR input gốc — bảo toàn signal, model chỉ học phần dư
+        # Residual: shortcut từ LR gốc + phần refine từ IWT output
+        # x đi thẳng → model chỉ học "phần dư" cần thêm
         pix = x + self.refine(pix)       # [B, 3, 128, 128]
 
         pix = self.up1(pix)              # [B, 3, 256, 256]
         pix = self.up2(pix)              # [B, 3, 512, 512]
 
-        out = self.final_refine(pix)     # [B, 3, 512, 512], range [0,1]
+        # Refine cuối + clamp thay Sigmoid
+        # Sigmoid gây output ≈ 0.5 khi weight random → PSNR 4dB
+        out = self.final_refine(pix)     # [B, 3, 512, 512]
+        out = out.clamp(0, 1)            # range [0,1]
 
         return out
