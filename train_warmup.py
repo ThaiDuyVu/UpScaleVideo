@@ -200,8 +200,7 @@ def frequency_loss(pred, target):
 
 
 def ssim_loss(pred, target):
-    """SSIM loss — supervise structural similarity."""
-    return 1.0 - ssim_metric(pred, target, data_range=1.0, size_average=True)
+    return 1.0 - ssim_metric(pred.float(), target.float(), data_range=1.0, size_average=True)
 
 
 # =========================
