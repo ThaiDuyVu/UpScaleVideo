@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.model.wavelet import DWT, IWT
-from src.model.vae import WaveletEncoder   # đổi tên import
+from src.model.vae import WaveletEncoder
 from src.model.kan import KAN
 
 
@@ -12,11 +12,25 @@ class Generator(nn.Module):
         super(Generator, self).__init__()
 
         self.dwt     = DWT()
-        self.encoder = WaveletEncoder()    # thay self.vae
+        self.encoder = WaveletEncoder()
         self.kan     = KAN()
         self.iwt     = IWT()
 
-        # Refine sau IWT
+        # ===================================================
+        # PIPELINE:
+        #
+        #  LR [B,3,128,128]
+        #  → DWT     → [B,12,64,64]   wavelet domain
+        #  → Encoder → [B,12,64,64]   deterministic latent
+        #  → KAN     → [B,12,64,64]   multi-scale feature refine
+        #  → IWT     → [B,3,128,128]  pixel domain
+        #  → refine  → [B,3,128,128]  residual refine
+        #  → up1     → [B,3,256,256]  upsample 2x
+        #  → up2     → [B,3,512,512]  upsample 2x
+        #  → final   → [B,3,512,512]  output [0,1]
+        # ===================================================
+
+        # Refine sau IWT trong pixel domain
         self.refine = nn.Sequential(
             nn.Conv2d(3, 32, 3, padding=1),
             nn.LeakyReLU(0.2),
@@ -25,24 +39,24 @@ class Generator(nn.Module):
             nn.Conv2d(32, 3, 3, padding=1),
         )
 
-        # Upscale 128 → 256 (2x) — thêm 2 conv trước PixelShuffle
+        # Upscale 128 → 256 (2x) — 2 conv + PixelShuffle tránh checkerboard
         self.up1 = nn.Sequential(
             nn.Conv2d(3, 32, 3, padding=1),
             nn.LeakyReLU(0.2),
             nn.Conv2d(32, 32, 3, padding=1),
             nn.LeakyReLU(0.2),
             nn.Conv2d(32, 12, 1),           # 12 = 3 * 2^2
-            nn.PixelShuffle(2),
+            nn.PixelShuffle(2),             # → [B, 3, 256, 256]
         )
 
-        # Upscale 256 → 512 (2x) — thêm 2 conv trước PixelShuffle
+        # Upscale 256 → 512 (2x) — 2 conv + PixelShuffle tránh checkerboard
         self.up2 = nn.Sequential(
             nn.Conv2d(3, 32, 3, padding=1),
             nn.LeakyReLU(0.2),
             nn.Conv2d(32, 32, 3, padding=1),
             nn.LeakyReLU(0.2),
-            nn.Conv2d(32, 12, 1),
-            nn.PixelShuffle(2),
+            nn.Conv2d(32, 12, 1),           # 12 = 3 * 2^2
+            nn.PixelShuffle(2),             # → [B, 3, 512, 512]
         )
 
         # Refine cuối
@@ -50,10 +64,10 @@ class Generator(nn.Module):
             nn.Conv2d(3, 32, 3, padding=1),
             nn.LeakyReLU(0.2),
             nn.Conv2d(32, 3, 3, padding=1),
-            nn.Sigmoid(),
+            nn.Sigmoid(),                   # output [0,1]
         )
 
-        # Init sub-pixel conv tránh checkerboard
+        # Init sub-pixel conv — tránh checkerboard artifact
         self._init_subpixel(self.up1)
         self._init_subpixel(self.up2)
 
@@ -67,16 +81,16 @@ class Generator(nn.Module):
     def forward(self, x):
         # x: [B, 3, 128, 128]
 
-        wave     = self.dwt(x)              # [B, 12, 64, 64]
-        recon    = self.encoder(wave)       # [B, 12, 64, 64] — không có mu/logvar
-        features = self.kan(recon)          # [B, 12, 64, 64]
-        pix      = self.iwt(features)       # [B, 3, 128, 128]
+        wave     = self.dwt(x)           # [B, 12, 64, 64]
+        recon    = self.encoder(wave)    # [B, 12, 64, 64]
+        features = self.kan(recon)       # [B, 12, 64, 64]
+        pix      = self.iwt(features)    # [B, 3, 128, 128]
 
-        pix = pix + self.refine(pix)        # residual refine
+        pix = pix + self.refine(pix)     # residual refine [B, 3, 128, 128]
 
-        pix = self.up1(pix)                 # [B, 3, 256, 256]
-        pix = self.up2(pix)                 # [B, 3, 512, 512]
+        pix = self.up1(pix)              # [B, 3, 256, 256]
+        pix = self.up2(pix)              # [B, 3, 512, 512]
 
-        out = self.final_refine(pix)        # [B, 3, 512, 512]
+        out = self.final_refine(pix)     # [B, 3, 512, 512], range [0,1]
 
-        return out                          # chỉ trả out, không mu/logvar
+        return out

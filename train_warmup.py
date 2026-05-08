@@ -52,8 +52,7 @@ train_set, val_set = random_split(dataset, [train_size, val_size])
 
 
 # =========================
-# HIGH PERFORMANCE DATALOADER
-# Optimized for V100
+# DATALOADER
 # =========================
 train_loader = DataLoader(
     train_set,
@@ -127,8 +126,9 @@ class PerceptualLoss(nn.Module):
         )
 
     def forward(self, pred, target):
-        pred_n   = (pred   - self.mean) / self.std
-        target_n = (target - self.mean) / self.std
+        # FIX: cast float32 → tránh VGG NaN với AMP float16
+        pred_n   = (pred.float()   - self.mean) / self.std
+        target_n = (target.float() - self.mean) / self.std
         return F.l1_loss(self.vgg(pred_n), self.vgg(target_n))
 
 
@@ -157,7 +157,7 @@ scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
 
 criterion = nn.L1Loss()
 
-# AMP scaler — chỉ active trên CUDA, tắt trên MPS/CPU
+# AMP scaler — chỉ active trên CUDA
 scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
 
 
@@ -174,7 +174,7 @@ best_val_loss = float("inf")
 def psnr(pred, target):
     pred   = pred.clamp(0, 1)
     target = target.clamp(0, 1)
-    mse = torch.mean((pred - target) ** 2)
+    mse    = torch.mean((pred - target) ** 2)
     if mse == 0:
         return torch.tensor(100.0)
     return 10 * torch.log10(1.0 / mse)
@@ -184,7 +184,7 @@ def psnr(pred, target):
 # LOSS FUNCTIONS
 # =========================
 def gradient_loss(pred, target):
-    """Edge loss — giữ lại để bổ sung cho frequency loss."""
+    """Edge loss."""
     pred_dx   = pred[:, :, :, 1:]   - pred[:, :, :, :-1]
     target_dx = target[:, :, :, 1:] - target[:, :, :, :-1]
     pred_dy   = pred[:, :, 1:, :]   - pred[:, :, :-1, :]
@@ -193,14 +193,29 @@ def gradient_loss(pred, target):
 
 
 def frequency_loss(pred, target):
-    """FFT Frequency loss — supervise high-frequency components."""
-    pred_fft   = torch.fft.rfft2(pred,   norm='ortho')
-    target_fft = torch.fft.rfft2(target, norm='ortho')
-    return F.l1_loss(torch.abs(pred_fft), torch.abs(target_fft))
+    """
+    FFT Frequency loss — supervise high-frequency components.
+    FIX: cast float32 + clamp amplitude → tránh NaN/Inf với AMP float16.
+    """
+    pred_f     = pred.float().clamp(0, 1)
+    target_f   = target.float().clamp(0, 1)
+    pred_fft   = torch.fft.rfft2(pred_f,   norm='ortho')
+    target_fft = torch.fft.rfft2(target_f, norm='ortho')
+    pred_amp   = torch.abs(pred_fft).clamp(max=1e4)
+    target_amp = torch.abs(target_fft).clamp(max=1e4)
+    return F.l1_loss(pred_amp, target_amp)
 
 
 def ssim_loss(pred, target):
-    return 1.0 - ssim_metric(pred.float(), target.float(), data_range=1.0, size_average=True)
+    """
+    SSIM loss — supervise structural similarity.
+    FIX: cast float32 → tránh NaN với AMP float16.
+    """
+    return 1.0 - ssim_metric(
+        pred.float(), target.float(),
+        data_range=1.0,
+        size_average=True
+    )
 
 
 # =========================
@@ -231,6 +246,13 @@ for epoch in range(epochs):
         with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
 
             pred = model(lr_img)
+
+            # FIX: kiểm tra NaN trong output model trước khi tính loss
+            if not torch.isfinite(pred).all():
+                print(f"\n[WARNING] NaN/Inf in model output — skipping batch")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
             pred = pred.clamp(0, 1)
 
             loss_l1   = criterion(pred, hr_img)
@@ -247,7 +269,7 @@ for epoch in range(epochs):
                 + 0.2 * loss_ssim
             )
 
-        # Skip batch NaN thay vì crash cả training
+        # Skip batch NaN/Inf
         if not torch.isfinite(loss):
             print(f"\n[WARNING] NaN/Inf loss — skipping batch | "
                   f"l1={loss_l1.item():.4f} edge={loss_edge.item():.4f} "
@@ -259,7 +281,8 @@ for epoch in range(epochs):
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+        # FIX: giảm max_norm 0.5 → 0.1 để KAN mới không explode đầu training
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
 
         scaler.step(optimizer)
         scaler.update()
@@ -319,8 +342,9 @@ for epoch in range(epochs):
             psnr_list.append(psnr(pred, hr_img).item())
 
             for b in range(pred.shape[0]):
-                pred_np = pred[b].permute(1, 2, 0).cpu().numpy()
-                hr_np   = hr_img[b].permute(1, 2, 0).cpu().numpy()
+                # FIX: .float() trước khi chuyển numpy → tránh lỗi float16 → numpy
+                pred_np = pred[b].permute(1, 2, 0).cpu().float().numpy()
+                hr_np   = hr_img[b].permute(1, 2, 0).cpu().float().numpy()
 
                 s = ssim(
                     hr_np, pred_np,
@@ -332,9 +356,8 @@ for epoch in range(epochs):
             num_batches += 1
 
     val_loss /= num_batches
-
-    avg_psnr = sum(psnr_list) / len(psnr_list)
-    avg_ssim = sum(ssim_list) / len(ssim_list)
+    avg_psnr  = sum(psnr_list) / len(psnr_list)
+    avg_ssim  = sum(ssim_list) / len(ssim_list)
 
     print(f"🔥 Val Loss:      {val_loss:.6f}")
     print(f"🔥 PSNR:          {avg_psnr:.2f} dB")

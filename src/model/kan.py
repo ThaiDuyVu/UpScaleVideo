@@ -12,21 +12,46 @@ class FastKANConv2d(nn.Module):
         self.out_channels = out_channels
         self.grid_size    = grid_size
 
+        # Base conv (linear part)
         self.base_conv = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding)
-        self.grid      = nn.Parameter(torch.linspace(-1, 1, grid_size), requires_grad=False)
-        self.coeff     = nn.Parameter(torch.randn(out_channels, in_channels, grid_size) * 0.01)
-        self.log_scale = nn.Parameter(torch.tensor(2.0))
+
+        # Grid parameters (learn nonlinear mapping)
+        self.grid = nn.Parameter(torch.linspace(-1, 1, grid_size), requires_grad=False)
+
+        # Coefficients: khởi tạo nhỏ → nonlinear term ≈ 0 lúc đầu
+        # → model học từ base_conv trước, sau đó dần học nonlinear
+        self.coeff = nn.Parameter(torch.randn(out_channels, in_channels, grid_size) * 0.01)
+
+        # Learnable scale thay vì cứng grid_size
+        self.log_scale = nn.Parameter(torch.tensor(2.0))  # scale = exp(2) ≈ 7.4
 
     def forward(self, x):
-        base   = self.base_conv(x)
+        # Base linear output
+        base = self.base_conv(x)
+
+        # Normalize input to [-1,1]
         x_norm = torch.tanh(x)
-        x_exp  = x_norm.unsqueeze(-1)
-        grid   = self.grid.view(1, 1, 1, 1, -1)
-        dist   = torch.abs(x_exp - grid)
-        scale  = torch.exp(torch.clamp(self.log_scale, min=0.5, max=3.0))
-        weights = torch.exp(-dist * scale)
+
+        # Expand for grid matching
+        x_exp = x_norm.unsqueeze(-1)            # [B, C, H, W, 1]
+        grid  = self.grid.view(1, 1, 1, 1, -1)  # [1, 1, 1, 1, G]
+
+        # Distance to grid points
+        dist = torch.abs(x_exp - grid)           # [B, C, H, W, G]
+
+        # Learnable scale — clamp tránh vanishing/exploding
+        scale   = torch.exp(torch.clamp(self.log_scale, min=0.5, max=3.0))
+        weights = torch.exp(-dist * scale)       # [B, C, H, W, G]
+
+        # Reshape: [B, C, H, W, G] → [B, C, G, H, W]
         weights = weights.permute(0, 1, 4, 2, 3)
+
+        # Nonlinear output: [B, out_channels, H, W]
         nonlinear = torch.einsum("b c g h w, o c g -> b o h w", weights, self.coeff)
+
+        # FIX: nan_to_num — tránh NaN/Inf từ einsum float16 overflow
+        nonlinear = torch.nan_to_num(nonlinear, nan=0.0, posinf=0.0, neginf=0.0)
+
         return base + nonlinear
 
 
@@ -45,8 +70,8 @@ class ChannelAttention(nn.Module):
 
     def forward(self, x):
         B, C, _, _ = x.shape
-        avg = self.fc(self.avg_pool(x).view(B, C))
-        mx  = self.fc(self.max_pool(x).view(B, C))
+        avg   = self.fc(self.avg_pool(x).view(B, C))
+        mx    = self.fc(self.max_pool(x).view(B, C))
         scale = self.sigmoid(avg + mx).view(B, C, 1, 1)
         return x * scale
 
@@ -59,13 +84,13 @@ class SpatialAttention(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        avg = x.mean(dim=1, keepdim=True)
-        mx, _ = x.max(dim=1, keepdim=True)
-        scale = self.sigmoid(self.conv(torch.cat([avg, mx], dim=1)))
+        avg    = x.mean(dim=1, keepdim=True)
+        mx, _  = x.max(dim=1, keepdim=True)
+        scale  = self.sigmoid(self.conv(torch.cat([avg, mx], dim=1)))
         return x * scale
 
 
-# ===== KAN BLOCK (multi-scale + CBAM) =====
+# ===== KAN BLOCK (multi-scale 3x3 + 5x5, CBAM attention) =====
 class KANBlock(nn.Module):
     def __init__(self, channels):
         super(KANBlock, self).__init__()
@@ -73,13 +98,13 @@ class KANBlock(nn.Module):
         # Multi-scale: song song 3x3 và 5x5
         self.kan1_3x3 = FastKANConv2d(channels, channels, kernel_size=3, padding=1)
         self.kan1_5x5 = FastKANConv2d(channels, channels, kernel_size=5, padding=2)
-        self.merge    = nn.Conv2d(channels * 2, channels, kernel_size=1)  # fuse 2 nhánh
+        self.merge    = nn.Conv2d(channels * 2, channels, kernel_size=1)
         self.norm1    = nn.GroupNorm(num_groups=4, num_channels=channels)
 
         self.kan2  = FastKANConv2d(channels, channels)
         self.norm2 = nn.GroupNorm(num_groups=4, num_channels=channels)
 
-        # CBAM sau kan2
+        # CBAM attention sau kan2
         self.cbam_c = ChannelAttention(channels)
         self.cbam_s = SpatialAttention()
 
@@ -104,7 +129,7 @@ class KANBlock(nn.Module):
         return x + residual
 
 
-# ===== STACKED KAN (tăng từ 4 → 6 blocks) =====
+# ===== STACKED KAN (6 blocks) =====
 class KAN(nn.Module):
     def __init__(self, channels=12, num_blocks=6):
         super(KAN, self).__init__()
