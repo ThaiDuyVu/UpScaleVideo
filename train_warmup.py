@@ -380,4 +380,4 @@ for epoch in range(epochs):
     if val_loss < best_val_loss:
         best_val_loss = val_loss
         torch.save(model.state_dict(), "checkpoints/best_model.pth")
-        print(f"✅ BEST MODEL SAVED (val_loss={best_val_loss:.6f})")
+        print(f"✅ BEST MODEL SAVED (val_loss={best_val_los:.6f})")
